@@ -117,8 +117,8 @@ class LoRaWANNode:
         except Exception as e:
             log.warning("join: parse failed: %s", e)
             return False
-        if phy.mhdr().mtype() != MType.JoinAccept:
-            log.warning("join: got mtype=%s, expected JoinAccept", phy.mhdr().mtype())
+        if phy.mhdr.mtype() != MType.JoinAccept:
+            log.warning("join: got mtype=%s, expected JoinAccept", phy.mhdr.mtype())
             return False
         join_accept = phy.payload()
         # Decrypt join-accept payload

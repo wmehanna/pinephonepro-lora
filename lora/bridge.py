@@ -51,6 +51,16 @@ class I2CBridge:
     def __exit__(self, *exc) -> None:
         self.close()
 
+    def read_one(self) -> Optional[int]:
+        """Read a single byte from the I2C read stream. Returns None on error/EOF."""
+        try:
+            b = os.read(self.fd, 1)
+        except OSError:
+            return None
+        if len(b) != 1:
+            return None
+        return b[0]
+
     def spi_transfer(self, out: Sequence[int]) -> bytes:
         """Send `out` to SX1262 and return MISO response of the same length."""
         n = len(out)
