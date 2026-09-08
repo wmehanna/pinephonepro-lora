@@ -12,6 +12,7 @@ References:
 - lupyuen/lora-sx1262 (C reference for command sequences).
 """
 
+import time
 from typing import Optional
 
 from bridge import I2CBridge
@@ -110,7 +111,6 @@ class SX1262:
         """
         # 1. Sleep with warm-start retention (set bit 0 of param = 0)
         self._set_command(OP_SET_SLEEP, bytes([0x00]))
-        import time
         time.sleep(0.005)
 
         # 2. Standby using RC oscillator
@@ -176,12 +176,12 @@ class SX1262:
     def get_irq(self) -> int:
         """Return the 16-bit IRQ status word.
 
-        SX1262 GetIrqStatus with the ATtiny84 bridge needs at least 8 SPI
-        bytes to clock out the IRQ register: the first ~4 bytes are status
-        preamble, then IRQ_H, IRQ_L appear at byte positions [4..5].
+        SX1262 GetIrqStatus via ATtiny84 bridge: send [0x12, 0x00, 0x00, 0x00]
+        (opcode + 3 NOPs = 4 bytes total), get back [status, NOP, IRQ_H, IRQ_L].
+        IRQ word is at response positions [2..3].
         """
-        r = self._cmd(OP_GET_IRQ_STATUS, bytes([0x00] * 7))  # 8-byte transfer
-        return (r[4] << 8) | r[5]
+        r = self._cmd(OP_GET_IRQ_STATUS, bytes([0x00, 0x00, 0x00]))  # 4-byte transfer
+        return (r[2] << 8) | r[3]
 
     def clear_irq(self, mask: int = 0xFFFF) -> None:
         self._set_command(OP_CLEAR_IRQ_STATUS, bytes([(mask >> 8) & 0xFF, mask & 0xFF]))
@@ -189,31 +189,40 @@ class SX1262:
     # ---------- TX ----------
 
     def transmit(self, payload: bytes) -> None:
-        """Send a single LoRa packet at the configured frequency."""
+        """Send a single LoRa packet at the configured frequency.
+
+        On the PineDio back cover, the SX1262 IRQ register readback returns
+        static garbage (0xa6a6) so IRQ polling for TX_DONE is unreliable.
+        Instead: kick SetTx, sleep a conservative TX duration (SF7/BW125
+        packet of N bytes takes roughly 70ms; 1.8s is a safe margin that
+        also covers the ~1.4s TCXO warm-up delay seen on this chip).
+        """
         if len(payload) > 255:
             raise SX1262Error(f"payload too long: {len(payload)}")
-        # Point TX at base 0, write the payload, kick TX (no timeout = 0xFFFFFF)
+        # Standby first - SX1262 must be in standby before SetTx
+        self._set_command(OP_SET_STANDBY, bytes([0x01]))  # STDBY_XOSC, keep TCXO warm
+        time.sleep(0.01)
+        # Point TX at base 0, write the payload, kick TX with finite timeout
         self._set_command(OP_SET_BUFFER_BASE, bytes([0x00, 0x80]))
         self._set_command(OP_WRITE_BUFFER, bytes([0x00]) + payload)
-        # SetTx with timeout in steps of 15.625us - 0 = single-shot
-        self._set_command(OP_SET_TX, bytes([0x00, 0x00, 0x00]))
-        # Wait for TX_DONE (poll IRQ)
-        import time
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            irq = self.get_irq()
-            if irq & IRQ_TX_DONE:
-                self.clear_irq()
-                return
-            time.sleep(0.01)
-        raise SX1262Error("TX timeout")
+        # SetTx with ~500ms on-chip timeout (0x7D00 = 32000 ticks * 15.625us = 500ms)
+        self._set_command(OP_SET_TX, bytes([0x00, 0x7D, 0x00]))
+        # PineDio quirk: SetTx takes ~1.4s to actually transition chip to TX.
+        # Sleep 1.8s (covers TCXO + TX duration at SF7 BW125).
+        time.sleep(1.8)
+        # After TX, return to standby so next SetTx works
+        self._set_command(OP_SET_STANDBY, bytes([0x01]))
+        # Best-effort IRQ clear
+        try:
+            self.clear_irq()
+        except Exception:
+            pass
 
     # ---------- RX ----------
 
     def receive(self, timeout_s: float) -> Optional[bytes]:
         """Put the radio in RX for up to timeout_s. Return payload bytes
         on RX_DONE, or None on TIMEOUT / CRC error."""
-        import time
         # Convert seconds to LoRa time steps: 15.625us per tick
         # 0xFFFFFF = ~15.7s, 0 = single shot, ~anything = timeout
         ticks = int(timeout_s * 64_000)  # 1 tick = 15.625us = 1/64000 s
