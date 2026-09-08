@@ -24,9 +24,10 @@ def sudo():
 
 def run(cmd, check=True, capture=False):
     """Run a shell command. Honors our sudo wrapper."""
+    stdin_input = "147147\n" if cmd and cmd[0] == "sudo" and "-S" in cmd else None
     result = subprocess.run(
         cmd,
-        input=b"147147\n" if cmd and cmd[0] == "sudo" and "-S" in cmd else None,
+        input=stdin_input,
         capture_output=capture,
         text=True,
     )
