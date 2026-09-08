@@ -1,0 +1,21 @@
+{
+  "gateway_ID": "FFFED62E55624467",
+  "server_address": "192.168.1.94",
+  "serv_port_up": 1700,
+  "serv_port_down": 1700,
+  "frequency_hz": 903000000,
+  "modulation": "LORA",
+  "datarate": "SF7BW125",
+  "coding_rate": "4/5",
+  "sync_word": "0x3444",
+  "preamble_len": 8,
+  "tx_power_dbm": 14,
+  "radio_0": {
+    "type": "SX1262",
+    "single_channel": true,
+    "channels": [
+      { "freq_hz": 903000000, "sf": 7, "bw_khz": 125 }
+    ]
+  },
+  "note": "US915 channel 0 (903.0 MHz SF7BW125). ChirpStack v4 stack on 192.168.1.94 is US915-only; gateway_ID derived from PinePhone wlan0 MAC d6:2e:55:62:44:67 with Semtech FFFE prefix."
+}

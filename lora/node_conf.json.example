@@ -1,0 +1,8 @@
+{
+  "dev_eui": "D62E556244670000",
+  "app_eui": "0000000000000000",
+  "app_key": "00112233445566778899AABBCCDDEEFF",
+  "uplink_interval_s": 60,
+  "uplink_payload": "PinePhone ping",
+  "note": "All EUI/KEY fields are 16 hex chars, MSB-first. dev_eui derived from wlan0 MAC d6:2e:55:62:44:67 with FFFE prefix. Register this DevEUI + AppKey in ChirpStack under the same tenant as the gateway."
+}

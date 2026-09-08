@@ -1,0 +1,15 @@
+[Unit]
+Description=LoRaWAN node mode (PineDio SX1262 + ATtiny84 bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/lora-venv/bin/python3 /opt/lora-pkt-fwd/lora-node.py -c /etc/lora-pkt-fwd/node_conf.json
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/lora-node.log
+StandardError=append:/var/log/lora-node.log
+
+[Install]
+WantedBy=multi-user.target

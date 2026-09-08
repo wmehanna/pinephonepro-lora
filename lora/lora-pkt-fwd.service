@@ -1,0 +1,15 @@
+[Unit]
+Description=LoRaWAN single-channel packet forwarder (PineDio SX1262 + ATtiny84 bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/lora-venv/bin/python3 /opt/lora-pkt-fwd/lora-pkt-fwd.py -c /etc/lora-pkt-fwd/global_conf.json
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/lora-pkt-fwd.log
+StandardError=append:/var/log/lora-pkt-fwd.log
+
+[Install]
+WantedBy=multi-user.target

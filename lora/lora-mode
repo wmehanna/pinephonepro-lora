@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""lora-mode - manage PinePhone Pro LoRa role (gateway | node).
+
+Single source of truth: /etc/lora-pkt-fwd/mode
+Reads mode on every command. set <gateway|node> swaps which systemd unit runs.
+status always shows current mode first.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+MODE_FILE = "/etc/lora-pkt-fwd/mode"
+GATEWAY_SERVICE = "lora-pkt-fwd.service"
+NODE_SERVICE = "lora-node.service"
+
+
+def sudo():
+    """Prefix that pipes the user password to sudo for NOPASSWD-disabled flows."""
+    return ["sudo", "-n", "-S", "-p", ""]
+
+
+def run(cmd, check=True, capture=False):
+    """Run a shell command. Honors our sudo wrapper."""
+    result = subprocess.run(
+        cmd,
+        input=b"147147\n" if cmd and cmd[0] == "sudo" and "-S" in cmd else None,
+        capture_output=capture,
+        text=True,
+    )
+    if check and result.returncode != 0:
+        sys.stderr.write(f"FAIL: {' '.join(cmd[:4])}... -> exit {result.returncode}\n")
+    return result
+
+
+def read_mode():
+    if not os.path.exists(MODE_FILE):
+        return None
+    with open(MODE_FILE) as f:
+        return f.read().strip()
+
+
+def write_mode(mode):
+    run(sudo() + ["tee", MODE_FILE], capture=True)
+    with open(MODE_FILE, "w") as f:
+        f.write(mode + "\n")
+
+
+def svc_is_active(name):
+    r = run(["systemctl", "is-active", name], check=False, capture=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def svc_status(name):
+    r = run(["systemctl", "show", name, "--property=ActiveEnterTimestamp,MainPID"], check=False, capture=True)
+    out = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k] = v
+    return out
+
+
+def cmd_status(_args):
+    mode = read_mode() or "(unset - default gateway)"
+    print(f"Mode: {mode.upper()}")
+    print()
+
+    if mode == "gateway" or mode is None:
+        gw = svc_status(GATEWAY_SERVICE)
+        print(f"  Gateway service ({GATEWAY_SERVICE}):")
+        print(f"    state:        {svc_is_active(GATEWAY_SERVICE) or 'inactive'}")
+        print(f"    since:        {gw.get('ActiveEnterTimestamp', '-')}")
+        print(f"    PID:          {gw.get('MainPID', '-')}")
+        print(f"    log:          /var/log/lora-pkt-fwd.log  (last line below)")
+        r = run(["sudo", "-n", "-S", "-p", "", "tail", "-1", "/var/log/lora-pkt-fwd.log"], check=False, capture=True)
+        print(f"    > {r.stdout.strip()}")
+    elif mode == "node":
+        nd = svc_status(NODE_SERVICE)
+        print(f"  Node service ({NODE_SERVICE}):")
+        print(f"    state:        {svc_is_active(NODE_SERVICE) or 'inactive'}")
+        print(f"    since:        {nd.get('ActiveEnterTimestamp', '-')}")
+        print(f"    PID:          {nd.get('MainPID', '-')}")
+        print(f"    log:          /var/log/lora-node.log  (last line below)")
+        r = run(["sudo", "-n", "-S", "-p", "", "tail", "-1", "/var/log/lora-node.log"], check=False, capture=True)
+        print(f"    > {r.stdout.strip()}")
+    else:
+        print(f"  Unknown mode '{mode}' in {MODE_FILE}")
+        print(f"  Fix with: lora-mode set gateway   OR   lora-mode set node")
+
+    print()
+    print("Commands:")
+    print("  lora-mode set gateway    run as LoRaWAN packet forwarder")
+    print("  lora-mode set node       run as LoRaWAN device (OTAA uplink)")
+    print("  lora-mode status         this view")
+
+
+def cmd_set(args):
+    target = args.mode
+    if target not in ("gateway", "node"):
+        print(f"Mode must be 'gateway' or 'node', got '{target}'")
+        sys.exit(2)
+
+    current = read_mode()
+    if current == target:
+        print(f"Already in {target.upper()} mode (no change).")
+        return
+
+    print(f"Switching: {current or '(unset)'} -> {target.upper()}")
+    print()
+
+    # Stop the currently-active mode
+    if current == "gateway":
+        print(f"Stopping {GATEWAY_SERVICE}...")
+        run(["sudo", "-n", "-S", "-p", "", "systemctl", "stop", GATEWAY_SERVICE], check=False)
+    elif current == "node":
+        print(f"Stopping {NODE_SERVICE}...")
+        run(["sudo", "-n", "-S", "-p", "", "systemctl", "stop", NODE_SERVICE], check=False)
+
+    # Start the target
+    if target == "gateway":
+        print(f"Starting {GATEWAY_SERVICE}...")
+        run(["sudo", "-n", "-S", "-p", "", "systemctl", "start", GATEWAY_SERVICE], check=False)
+    elif target == "node":
+        print(f"Starting {NODE_SERVICE}...")
+        run(["sudo", "-n", "-S", "-p", "", "systemctl", "start", NODE_SERVICE], check=False)
+
+    write_mode(target)
+    print()
+    print(f"Mode is now {target.upper()}. Verify with: lora-mode status")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="lora-mode", description="Manage PinePhone Pro LoRa role")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status", help="show current mode and service state")
+    p_set = sub.add_parser("set", help="switch mode")
+    p_set.add_argument("mode", choices=["gateway", "node"], help="target mode")
+    args = p.parse_args()
+
+    if args.cmd == "status":
+        cmd_status(args)
+    elif args.cmd == "set":
+        cmd_set(args)
+
+
+if __name__ == "__main__":
+    main()
