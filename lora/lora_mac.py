@@ -63,7 +63,7 @@ class LoRaWANNode:
     Downlinks arrive via listen_window().
     """
 
-    def __init__(self, dev_eui: str, app_eui: str, app_key: str, freq_hz: int = 903_000_000):
+    def __init__(self, dev_eui: str, app_eui: str, app_key: str, freq_hz: int = 903_900_000):
         self.dev_eui = bytes.fromhex(dev_eui)
         self.app_eui = bytes.fromhex(app_eui)
         self.app_key = bytes.fromhex(app_key)
@@ -117,8 +117,8 @@ class LoRaWANNode:
         except Exception as e:
             log.warning("join: parse failed: %s", e)
             return False
-        if phy.mhdr.mtype() != MType.JoinAccept:
-            log.warning("join: got mtype=%s, expected JoinAccept", phy.mhdr.mtype())
+        if phy.mhdr.mtype != MType.JoinAccept:
+            log.warning("join: got mtype=%s, expected JoinAccept", phy.mhdr.mtype)
             return False
         join_accept = phy.payload()
         # Decrypt join-accept payload
