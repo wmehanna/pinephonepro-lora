@@ -242,17 +242,19 @@ class SX1262:
             if irq & (IRQ_RX_DONE | IRQ_TIMEOUT | IRQ_HEADER_ERROR | IRQ_CRC_ERROR):
                 self.clear_irq()
                 if irq & IRQ_RX_DONE:
-                    # GetRxBufferStatus: MOSI [0x13, NOP, NOP, NOP]
-                    # MISO: [chip_status, payload_length, rx_start_offset, junk]
+                    # GetRxBufferStatus: MOSI [0x13, NOP, NOP, NOP] (4 bytes)
+                    # MISO: [junk, RFU, payload_length, rx_start_offset]
+                    # (same off-by-one class as get_irq: real data starts one
+                    # byte later than a naive opcode+3-NOP read would suggest)
                     r = self._cmd(OP_GET_RX_BUFFER_STATUS, bytes([0x00, 0x00, 0x00]))
-                    plen = r[1]
-                    start = r[2]
+                    plen = r[2]
+                    start = r[3]
                     if plen == 0 or plen > 255:
                         return None
-                    # ReadBuffer: MOSI [0x1E, offset, NOP*N]
-                    # MISO: [chip_status, NOP, data0, data1, ...]
-                    read_len = plen + 2
-                    buf = self._cmd(OP_READ_BUFFER, bytes([start] + [0x00] * (read_len - 1)))
+                    # ReadBuffer: MOSI [0x1E, offset, NOP x plen] (plen+2 bytes total)
+                    # MISO: [junk, RFU, data0, data1, ..., data(plen-1)]
+                    # payload after opcode = [offset] + plen NOPs = plen+1 bytes
+                    buf = self._cmd(OP_READ_BUFFER, bytes([start] + [0x00] * plen))
                     return bytes(buf[2 : 2 + plen])
                 return None
             time.sleep(0.01)
