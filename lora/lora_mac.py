@@ -68,7 +68,12 @@ class LoRaWANNode:
         self.app_eui = bytes.fromhex(app_eui)
         self.app_key = bytes.fromhex(app_key)
         self.freq_hz = freq_hz
-        self.dev_nonce = 0
+        # DevNonce must never repeat for this DevEUI+JoinEUI pair per
+        # LoRaWAN spec. Seeding from wall-clock time instead of 0 avoids
+        # colliding with a nonce ChirpStack already accepted on a prior run
+        # (process restarts reset in-memory state, but the server remembers).
+        import time as _t
+        self.dev_nonce = int(_t.time()) & 0xFFFF
         self.joined = False
         self.dev_addr = None
         self.nwk_skey = None
@@ -108,7 +113,13 @@ class LoRaWANNode:
         log.info("OTAA join: dev_eui=%s dev_nonce=%d", self.dev_eui.hex(), self.dev_nonce)
         self.radio.transmit(frame)
         # RX1 window opens 1s after TX end
-        pkt = self._wait_for_packet(timeout_s=self.rx1_delay_s + 4.0)
+        # transmit() blocks with an internal ~1.8s tail sleep after the
+        # actual radiate (this back cover cannot confirm TX_DONE any other
+        # way), so by the time we get here RX1 (opens 1.0s post-TX) has
+        # likely already closed. Listen for a long combined window so we
+        # still have real margin to catch RX2 (opens 2.0s post-TX) even
+        # accounting for I2C bridge round-trip latency on SetRx.
+        pkt = self._wait_for_packet(timeout_s=8.0)
         if pkt is None:
             log.warning("join: no packet in RX1")
             return False
