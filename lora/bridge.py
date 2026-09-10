@@ -14,7 +14,7 @@ Protocol reverse-engineered from puurpl/pinephonepro-lora (I2CBridgeHal.h):
 import fcntl
 import os
 import time
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 CMD_TRANSMIT = 0x01
 DEFAULT_ADDR = 0x28

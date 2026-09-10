@@ -199,10 +199,19 @@ class SX1262:
         time to plausibly miss them. This cuts it to 4.
         """
         self._set_command(OP_SET_STANDBY, bytes([STDBY_RC]))
+        time.sleep(0.001)
         rf_reg = int((freq_hz << 25) / RF_FREQ_XTAL_HZ) & 0xFFFFFFFF
         self._set_command(OP_SET_RF_FREQUENCY, rf_reg.to_bytes(4, "big"))
         self._set_command(OP_SET_MODULATION_PARAMS, bytes([sf & 0xFF, bw_idx, cr_idx]))
         self._set_command(OP_CLEAR_IRQ_STATUS, bytes([0xFF, 0xFF]))
+        # Small settling delay: the ATtiny84 bridge returns transient garbage
+        # on the IRQ register for the first few reads immediately after a
+        # burst of back-to-back commands with no gap (observed empirically:
+        # first get_irq() after retune() often shows a stale non-zero value
+        # even though ClearIrq was just issued). init() has natural gaps
+        # from its longer command sequence; this lean path needs one added
+        # back explicitly.
+        time.sleep(0.003)
 
     # ---------- IRQ ----------
 

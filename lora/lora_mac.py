@@ -137,7 +137,7 @@ class LoRaWANNode:
         """
         self.radio.retune(freq_hz=RX1_FREQ_HZ, sf=7, bw_idx=RX_BW_IDX, cr_idx=1)
 
-    def join(self, timeout_s: float = 8.0) -> bool:
+    def join(self, timeout_s: float = 15.0) -> bool:
         """Send OTAA join-request and listen for join-accept.
 
         Returns True if join succeeded, False if timeout/no accept.
@@ -153,8 +153,15 @@ class LoRaWANNode:
         frame = mhdr.generate() + join_req.generate() + mic
         log.info("OTAA join: dev_eui=%s dev_nonce=%d", self.dev_eui.hex(), self.dev_nonce)
         self._retune_uplink()
+        t_tx_start = time.monotonic()
         self.radio.transmit(frame)
+        t_tx_done = time.monotonic()
         self._retune_rx1()
+        t_listen_start = time.monotonic()
+        log.info(
+            "join timing: tx_call=%.3fs retune_rx1=%.3fs (tx_start->listen_start=%.3fs)",
+            t_tx_done - t_tx_start, t_listen_start - t_tx_done, t_listen_start - t_tx_start,
+        )
         # RX1 window opens 1s after TX end
         # transmit() blocks with an internal ~1.8s tail sleep after the
         # actual radiate (this back cover cannot confirm TX_DONE any other
@@ -236,14 +243,33 @@ class LoRaWANNode:
         return self._wait_for_packet(timeout_s=timeout_s)
 
     def _wait_for_packet(self, timeout_s: float):
-        """Wait up to timeout_s for any received packet."""
+        """Wait up to timeout_s for any received packet.
+
+        radio.receive() is what actually issues SetRx and arms the chip to
+        listen; polling get_irq() alone (the old approach here) never arms
+        RX at all; after a transmit() the chip sits in standby forever and
+        RX_DONE can never legitimately set. Call receive() directly in a
+        loop of short slices so the chip is genuinely listening the whole
+        window, not just idling in standby while we poll a stale register.
+        """
         deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            irq = self.radio.get_irq()
-            if irq & IRQ_RX_DONE:
-                pkt = self.radio.receive(timeout_s=0.1)
-                if pkt:
-                    self.radio.clear_irq(IRQ_RX_DONE)
-                    return pkt
-            time.sleep(0.05)
-        return None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            # One long receive() call (up to 3s at a time) instead of many
+            # short slices: each SetRx re-arm has real settling cost on this
+            # bridge, and chopping the window into 0.5s pieces spent more
+            # time re-arming than actually listening.
+            try:
+                pkt = self.radio.receive(timeout_s=min(remaining, 3.0))
+            except Exception as e:
+                log.info("_wait_for_packet: receive() raised %s, resyncing bridge", e)
+                try:
+                    self.bridge.sync_buffer(verbose=False)
+                except Exception:
+                    pass
+                time.sleep(0.05)
+                continue
+            if pkt:
+                return pkt
