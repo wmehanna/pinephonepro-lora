@@ -185,6 +185,25 @@ class SX1262:
         # 12. Clear any pending IRQs
         self._set_command(OP_CLEAR_IRQ_STATUS, bytes([0xFF, 0xFF]))
 
+    def retune(self, freq_hz: int, sf: int = DEFAULT_SF, bw_idx: int = DEFAULT_BW_IDX, cr_idx: int = DEFAULT_CR_IDX) -> None:
+        """Fast frequency/bandwidth change without the full init() sequence.
+
+        Switching between the uplink channel (903.9 MHz / 125 kHz) and the
+        US915 RX1 downlink channel (923.3 MHz / 500 kHz) needs only these
+        three registers. The full init() also touches PA config, TX params,
+        packet params, sync word, IRQ params and buffer base, none of which
+        change between TX and RX in this application, and each is a
+        separate I2C-bridge round-trip. On a hardware LoRaWAN join, RX1/RX2
+        are narrow, precisely-timed windows (LoRaWAN spec: 1-6s post-TX);
+        11 round-trips of unnecessary setup was eating enough wall-clock
+        time to plausibly miss them. This cuts it to 4.
+        """
+        self._set_command(OP_SET_STANDBY, bytes([STDBY_RC]))
+        rf_reg = int((freq_hz << 25) / RF_FREQ_XTAL_HZ) & 0xFFFFFFFF
+        self._set_command(OP_SET_RF_FREQUENCY, rf_reg.to_bytes(4, "big"))
+        self._set_command(OP_SET_MODULATION_PARAMS, bytes([sf & 0xFF, bw_idx, cr_idx]))
+        self._set_command(OP_CLEAR_IRQ_STATUS, bytes([0xFF, 0xFF]))
+
     # ---------- IRQ ----------
 
     def get_irq(self) -> int:

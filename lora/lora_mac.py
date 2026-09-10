@@ -17,6 +17,7 @@ Usage:
 import logging
 import sys
 import os
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -33,6 +34,15 @@ from pylorawan.common import (
 from pylorawan.encryption import aes128_encrypt
 
 log = logging.getLogger("lora_mac")
+
+# US915 downlink (RX1) channel plan is a FIXED set of eight 500 kHz channels,
+# completely separate from the 125 kHz uplink channels. RX1 downlink channel
+# = uplink_channel % 8. Our uplink is always on sub-band-2 channel 8
+# (903.9 MHz), so 8 % 8 = 0 -> downlink channel 0 = 923.3 MHz. Confirmed
+# directly from the Dragino gateway's own txpk logs: every join-accept it
+# actually transmits shows freq=923.3, datr=SF7BW500.
+RX1_FREQ_HZ = 923_300_000
+RX_BW_IDX = 0x06  # 500 kHz (SX1262 datasheet Table 13-47; 0x04 is 125 kHz)
 
 
 def _derive_session_keys(app_key: bytes, dev_nonce: bytes, join_nonce: bytes, dev_addr: bytes) -> tuple:
@@ -72,8 +82,7 @@ class LoRaWANNode:
         # LoRaWAN spec. Seeding from wall-clock time instead of 0 avoids
         # colliding with a nonce ChirpStack already accepted on a prior run
         # (process restarts reset in-memory state, but the server remembers).
-        import time as _t
-        self.dev_nonce = int(_t.time()) & 0xFFFF
+        self.dev_nonce = int(time.time()) & 0xFFFF
         self.joined = False
         self.dev_addr = None
         self.nwk_skey = None
@@ -86,6 +95,10 @@ class LoRaWANNode:
         log.info("init SX1262 via ATtiny84 bridge (US915 ch 0, 903 MHz, SF7 BW125)")
         self.bridge = I2CBridge()
         self.radio = SX1262(self.bridge)
+        # One full init() at construction sets everything that never changes
+        # again (packet params, sync word, IRQ params, buffer base) and
+        # caches the values transmit() needs on the SX1262 object. Every
+        # later channel switch uses the fast radio.retune() path instead.
         self.radio.init(
             freq_hz=self.freq_hz,
             sf=7,
@@ -95,6 +108,34 @@ class LoRaWANNode:
             sync_word=0x3444,
             tx_power_dbm=14,
         )
+
+    def _retune_uplink(self) -> None:
+        """(Re)tune the radio to the uplink channel: 903.9 MHz / 125 kHz.
+
+        Must be called before every transmit(). The radio is shared between
+        TX and RX and gets retuned to a completely different frequency and
+        bandwidth for RX1 (see _retune_rx1), so without this every transmit
+        after the first RX1 listen would go out on the wrong channel too.
+        Uses the fast path (radio.retune), not the full init() sequence,
+        RX1/RX2 are narrow timed windows and the extra ~7 round-trips the
+        full init() does (PA config, TX params, sync word, IRQ params,
+        buffer base, none of which actually change here) were eating
+        enough wall-clock time to plausibly miss them.
+        """
+        self.radio.retune(freq_hz=self.freq_hz, sf=7, bw_idx=0x04, cr_idx=1)
+
+    def _retune_rx1(self) -> None:
+        """Retune to the US915 RX1 downlink channel: 923.3 MHz / 500 kHz.
+
+        US915 RX1 uses a FIXED set of eight 500 kHz downlink channels,
+        completely separate from the 125 kHz uplink channels (RX1 channel
+        = uplink_channel % 8). Our uplink is always sub-band-2 channel 8
+        (903.9 MHz), so 8 % 8 = 0 -> downlink channel 0 = 923.3 MHz.
+        Confirmed directly from the Dragino gateway's own txpk logs: every
+        join-accept and downlink it actually transmits shows freq=923.3,
+        datr=SF7BW500.
+        """
+        self.radio.retune(freq_hz=RX1_FREQ_HZ, sf=7, bw_idx=RX_BW_IDX, cr_idx=1)
 
     def join(self, timeout_s: float = 8.0) -> bool:
         """Send OTAA join-request and listen for join-accept.
@@ -111,7 +152,9 @@ class LoRaWANNode:
         mic = generate_mic_join_request(mhdr, join_req, self.app_key)
         frame = mhdr.generate() + join_req.generate() + mic
         log.info("OTAA join: dev_eui=%s dev_nonce=%d", self.dev_eui.hex(), self.dev_nonce)
+        self._retune_uplink()
         self.radio.transmit(frame)
+        self._retune_rx1()
         # RX1 window opens 1s after TX end
         # transmit() blocks with an internal ~1.8s tail sleep after the
         # actual radiate (this back cover cannot confirm TX_DONE any other
@@ -119,17 +162,33 @@ class LoRaWANNode:
         # likely already closed. Listen for a long combined window so we
         # still have real margin to catch RX2 (opens 2.0s post-TX) even
         # accounting for I2C bridge round-trip latency on SetRx.
-        pkt = self._wait_for_packet(timeout_s=8.0)
-        if pkt is None:
-            log.warning("join: no packet in RX1")
-            return False
-        try:
-            phy = PHYPayload.parse(pkt)
-        except Exception as e:
-            log.warning("join: parse failed: %s", e)
-            return False
-        if phy.mhdr.mtype != MType.JoinAccept:
-            log.warning("join: got mtype=%s, expected JoinAccept", phy.mhdr.mtype)
+        # The ambient RF environment here has other LoRaWAN devices
+        # transmitting on these same channels roughly every 8-10s (dense
+        # local Helium network). A naive "return on first RX_DONE" misses
+        # the real join-accept whenever a neighbour's uplink lands in the
+        # window first. Keep listening and skip anything that doesn't
+        # parse as a JoinAccept until the whole window is used up.
+        deadline = time.monotonic() + timeout_s
+        phy = None
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            pkt = self._wait_for_packet(timeout_s=remaining)
+            if pkt is None:
+                break
+            try:
+                candidate = PHYPayload.parse(pkt)
+            except Exception as e:
+                log.info("join: skipping non-parseable packet in RX window: %s", e)
+                continue
+            if candidate.mhdr.mtype != MType.JoinAccept:
+                log.info("join: skipping mtype=%s (not JoinAccept), still listening", candidate.mhdr.mtype)
+                continue
+            phy = candidate
+            break
+        if phy is None:
+            log.warning("join: no JoinAccept received in %.1fs window", timeout_s)
             return False
         join_accept = phy.payload()
         # Decrypt join-accept payload
@@ -166,17 +225,18 @@ class LoRaWANNode:
         mic = generate_mic_mac_payload(mhdr, MACPayloadUplink.parse_raw(mac_payload[1:], self.dev_addr, self.frame_counter, 0), self.nwk_skey)
         frame = mhdr.generate() + mac_payload + mic
         log.info("uplink tx: fc=%d len=%d", self.frame_counter, len(frame))
+        self._retune_uplink()
         self.radio.transmit(frame)
         return True
 
     def listen_window(self, timeout_s: float = 3.0):
         """Open RX window, wait for packet. Returns raw bytes or None."""
+        self._retune_rx1()
         log.info("RX window open (%ds)...", timeout_s)
         return self._wait_for_packet(timeout_s=timeout_s)
 
     def _wait_for_packet(self, timeout_s: float):
         """Wait up to timeout_s for any received packet."""
-        import time
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             irq = self.radio.get_irq()
