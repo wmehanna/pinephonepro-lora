@@ -5,7 +5,7 @@ Uses lora_mac.py (pylorawan for LoRaWAN MAC + bridge.py + sx1262.py for radio).
 
 Status:
 - OTAA join + frame counter: works against ChirpStack v4
-- Downlink decryption: works (pylorawan decrypt_frm_payload)
+- JoinAccept authentication: verified; data downlinks are logged as raw bytes
 - ADR: not implemented (always SF7BW125)
 - Frame counters are in-memory only; restart resets counter
 

@@ -11,7 +11,7 @@ Usage:
   node = LoRaWANNode(dev_eui, app_eui, app_key)
   if node.join():
       node.send_uplink(b"hello")
-      downlink = node.listen_window(seconds=3)
+      downlink = node.listen_window(timeout_s=3)
 """
 
 import logging
@@ -22,16 +22,16 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from bridge import I2CBridge
-from sx1262 import SX1262, IRQ_RX_DONE
+from sx1262 import SX1262
 
-from pylorawan.message import MHDR, MType, JoinRequest, MACPayloadUplink, PHYPayload
+from pylorawan.message import MHDR, MType, JoinRequest, JoinAccept, MACPayloadUplink
 from pylorawan.common import (
     generate_mic_join_request,
+    generate_nwk_s_key,
+    generate_app_s_key,
     generate_mic_mac_payload,
-    decrypt_frm_payload,
     encrypt_frm_payload,
 )
-from pylorawan.encryption import aes128_encrypt
 
 log = logging.getLogger("lora_mac")
 
@@ -45,25 +45,8 @@ RX1_FREQ_HZ = 923_300_000
 RX_BW_IDX = 0x06  # 500 kHz (SX1262 datasheet Table 13-47; 0x04 is 125 kHz)
 
 
-def _derive_session_keys(app_key: bytes, dev_nonce: bytes, join_nonce: bytes, dev_addr: bytes) -> tuple:
-    """Derive NwkSKey and AppSKey per LoRaWAN 1.0.x spec."""
-    base_nwk = bytes([0x01]) + dev_nonce + join_nonce
-    nwk_skey = aes128_encrypt(app_key, base_nwk)
-    base_app = bytes([0x02]) + dev_nonce + join_nonce
-    app_skey = aes128_encrypt(app_key, base_app)
-    return nwk_skey, app_skey
-
-
 def _dev_addr_to_bytes(dev_addr: int) -> bytes:
     return dev_addr.to_bytes(4, "little")
-
-
-def _dev_nonce_to_bytes(dev_nonce: int) -> bytes:
-    return dev_nonce.to_bytes(2, "little")
-
-
-def _join_nonce_to_bytes(join_nonce: int) -> bytes:
-    return join_nonce.to_bytes(3, "little")
 
 
 class LoRaWANNode:
@@ -80,8 +63,8 @@ class LoRaWANNode:
         self.freq_hz = freq_hz
         # DevNonce must never repeat for this DevEUI+JoinEUI pair per
         # LoRaWAN spec. Seeding from wall-clock time instead of 0 avoids
-        # colliding with a nonce ChirpStack already accepted on a prior run
-        # (process restarts reset in-memory state, but the server remembers).
+        # immediate restart collisions. This is not persistent nonce storage:
+        # clock rollback or a 16-bit wrap can still reuse a nonce.
         self.dev_nonce = int(time.time()) & 0xFFFF
         self.joined = False
         self.dev_addr = None
@@ -92,8 +75,10 @@ class LoRaWANNode:
         self.rx2_delay_s = 2.0
         self.frame_counter = 0
 
-        log.info("init SX1262 via ATtiny84 bridge (US915 ch 0, 903 MHz, SF7 BW125)")
+        log.info("init SX1262 via ATtiny84 bridge (US915 ch 8, 903.9 MHz, SF7 BW125)")
         self.bridge = I2CBridge()
+        if not self.bridge.sync_buffer(verbose=False):
+            raise RuntimeError("ATtiny84 bridge synchronization failed")
         self.radio = SX1262(self.bridge)
         # One full init() at construction sets everything that never changes
         # again (packet params, sync word, IRQ params, buffer base) and
@@ -162,57 +147,36 @@ class LoRaWANNode:
             "join timing: tx_call=%.3fs retune_rx1=%.3fs (tx_start->listen_start=%.3fs)",
             t_tx_done - t_tx_start, t_listen_start - t_tx_done, t_listen_start - t_tx_start,
         )
-        # RX1 window opens 1s after TX end
-        # transmit() blocks with an internal ~1.8s tail sleep after the
-        # actual radiate (this back cover cannot confirm TX_DONE any other
-        # way), so by the time we get here RX1 (opens 1.0s post-TX) has
-        # likely already closed. Listen for a long combined window so we
-        # still have real margin to catch RX2 (opens 2.0s post-TX) even
-        # accounting for I2C bridge round-trip latency on SetRx.
-        # The ambient RF environment here has other LoRaWAN devices
-        # transmitting on these same channels roughly every 8-10s (dense
-        # local Helium network). A naive "return on first RX_DONE" misses
-        # the real join-accept whenever a neighbour's uplink lands in the
-        # window first. Keep listening and skip anything that doesn't
-        # parse as a JoinAccept until the whole window is used up.
+        # JoinAccept uses JOIN_ACCEPT_DELAY1=5s (not the data RXDelay).
+        # Arm early and keep RX continuous through that scheduled downlink.
         deadline = time.monotonic() + timeout_s
-        phy = None
+        join_accept = None
         while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            pkt = self._wait_for_packet(timeout_s=remaining)
+            pkt = self._wait_for_packet(timeout_s=deadline - time.monotonic())
             if pkt is None:
                 break
+            if len(pkt) not in (17, 33) or pkt[0] != 0x20:
+                log.info("join: skipping non-JoinAccept packet")
+                continue
             try:
-                candidate = PHYPayload.parse(pkt)
+                # This parser decrypts the complete ciphertext (including MIC)
+                # and verifies the MIC before returning any session fields.
+                join_accept = JoinAccept.parse(pkt, self.app_key)
             except Exception as e:
-                log.info("join: skipping non-parseable packet in RX window: %s", e)
+                log.warning("join: invalid JoinAccept: %s", e)
                 continue
-            if candidate.mhdr.mtype != MType.JoinAccept:
-                log.info("join: skipping mtype=%s (not JoinAccept), still listening", candidate.mhdr.mtype)
-                continue
-            phy = candidate
             break
-        if phy is None:
+        if join_accept is None:
             log.warning("join: no JoinAccept received in %.1fs window", timeout_s)
             return False
-        join_accept = phy.payload()
-        # Decrypt join-accept payload
-        encrypted = join_accept.generate()
-        decrypted = aes128_encrypt(self.app_key, encrypted)  # ECB single-block decrypt
-        # Parse decrypted payload
-        join_nonce = int.from_bytes(decrypted[0:3], "big")
-        dev_addr = int.from_bytes(decrypted[3:7], "little")
-        # DLSettings + RXDelay follow but we ignore for now
+        join_nonce = join_accept.app_nonce
+        dev_addr = join_accept.dev_addr
         self.join_nonce = join_nonce
         self.dev_addr = dev_addr
-        self.nwk_skey, self.app_skey = _derive_session_keys(
-            self.app_key,
-            _dev_nonce_to_bytes(self.dev_nonce),
-            _join_nonce_to_bytes(join_nonce),
-            _dev_addr_to_bytes(dev_addr),
-        )
+        self.nwk_skey = generate_nwk_s_key(self.app_key, join_nonce, join_accept.net_id, self.dev_nonce)
+        self.app_skey = generate_app_s_key(self.app_key, join_nonce, join_accept.net_id, self.dev_nonce)
+        self.rx1_delay_s = float(join_accept.rx_delay or 1)
+        self.rx2_delay_s = self.rx1_delay_s + 1
         self.joined = True
         log.info("joined: dev_addr=%08x join_nonce=%06x", dev_addr, join_nonce)
         return True
@@ -224,13 +188,15 @@ class LoRaWANNode:
             return False
         self.frame_counter += 1
         mhdr = MHDR(mtype=MType.UnconfirmedDataUp, major=0)
-        fhdr = mhdr.generate() + _dev_addr_to_bytes(self.dev_addr)[:4] + self.frame_counter.to_bytes(2, "little") + bytes([0x00])
+        fhdr = (_dev_addr_to_bytes(self.dev_addr) + bytes([0x00])
+                + (self.frame_counter & 0xFFFF).to_bytes(2, "little"))
         encrypted_payload = encrypt_frm_payload(
-            payload, self.app_skey, self.dev_addr, self.frame_counter, direction=0  # uplink
+            payload, self.app_skey, self.dev_addr, self.frame_counter, direction=0
         )
-        mac_payload = fhdr + bytes([fport]) + encrypted_payload
-        mic = generate_mic_mac_payload(mhdr, MACPayloadUplink.parse_raw(mac_payload[1:], self.dev_addr, self.frame_counter, 0), self.nwk_skey)
-        frame = mhdr.generate() + mac_payload + mic
+        mac_payload = MACPayloadUplink.parse(fhdr + bytes([fport]) + encrypted_payload)
+        mac_payload.fhdr.f_cnt = self.frame_counter
+        mic = generate_mic_mac_payload(mhdr, mac_payload, self.nwk_skey)
+        frame = mhdr.generate() + mac_payload.generate() + mic
         log.info("uplink tx: fc=%d len=%d", self.frame_counter, len(frame))
         self._retune_uplink()
         self.radio.transmit(frame)
@@ -248,21 +214,17 @@ class LoRaWANNode:
         radio.receive() is what actually issues SetRx and arms the chip to
         listen; polling get_irq() alone (the old approach here) never arms
         RX at all; after a transmit() the chip sits in standby forever and
-        RX_DONE can never legitimately set. Call receive() directly in a
-        loop of short slices so the chip is genuinely listening the whole
-        window, not just idling in standby while we poll a stale register.
+        RX_DONE can never legitimately set. Keep receive() armed until the
+        deadline, re-entering only after a packet or error.
         """
         deadline = time.monotonic() + timeout_s
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
-            # One long receive() call (up to 3s at a time) instead of many
-            # short slices: each SetRx re-arm has real settling cost on this
-            # bridge, and chopping the window into 0.5s pieces spent more
-            # time re-arming than actually listening.
+            # Keep RX armed across the whole remaining join window.
             try:
-                pkt = self.radio.receive(timeout_s=min(remaining, 3.0))
+                pkt = self.radio.receive(timeout_s=remaining, downlink=True)
             except Exception as e:
                 log.info("_wait_for_packet: receive() raised %s, resyncing bridge", e)
                 try:

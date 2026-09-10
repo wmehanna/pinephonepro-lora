@@ -90,33 +90,33 @@ class I2CBridge:
         raise BridgeError(f"I2C SPI transfer failed after {RETRY_COUNT} attempts")
 
     def sync_buffer(self, verbose: bool = True) -> bool:
-        """Drain stale bytes from the ATtiny84 buffer after power-up.
+        """Align the circular read cursor with a known end-of-response marker.
 
-        Puts the SX1262 into standby, then drains the I2C read stream of any
-        leftover bytes from the ATtiny's circular buffer. Returns True as
-        long as no I2C errors occurred - we don't try to verify a specific
-        echo pattern because the bridge mixes status responses from multiple
-        prior commands. The downstream radio init is the real health check.
+        Empty reads do not return EOF: firmware cycles through its 128-byte
+        buffer forever. Blind draining cannot establish cursor alignment.
         """
-        try:
-            self.spi_transfer([0x80, 0x00])  # StandbyRC
-        except BridgeError:
-            return False
-        time.sleep(0.005)
-
-        # Drain: read up to SYNC_MAX_BYTES or until no more bytes available
-        count = 0
-        while count < SYNC_MAX_BYTES:
-            try:
-                b = os.read(self.fd, 1)
-            except OSError:
-                break
-            if len(b) != 1:
-                break
-            count += 1
-        if verbose:
-            print(f"bridge sync: drained {count} bytes")
-        return True
+        commands = (
+            bytes([0x80, 0x00]),
+            bytes([0x8F, 0x00, 0x00]),
+            bytes([0x0E, 0x00]) + SYNC_SEQUENCE,
+            bytes([0x1E, 0x00, 0x00]) + bytes(len(SYNC_SEQUENCE)),
+        )
+        for command in commands:
+            data = bytes([CMD_TRANSMIT]) + command
+            if os.write(self.fd, data) != len(data):
+                return False
+            time.sleep(0.005)
+        seen = bytearray()
+        for count in range(SYNC_MAX_BYTES):
+            byte = self.read_one()
+            if byte is None:
+                return False
+            seen.append(byte)
+            if seen.endswith(SYNC_SEQUENCE):
+                if verbose:
+                    print(f"bridge sync: aligned after {count + 1} bytes")
+                return True
+        return False
 
     def shutdown(self) -> None:
         """Drain the buffer and put the SX1262 into standby."""

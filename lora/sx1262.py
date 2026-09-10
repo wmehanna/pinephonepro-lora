@@ -12,10 +12,13 @@ References:
 - lupyuen/lora-sx1262 (C reference for command sequences).
 """
 
+import logging
 import time
 from typing import Optional
 
 from bridge import I2CBridge
+
+log = logging.getLogger("sx1262")
 
 # SX1262 SPI opcodes
 OP_SET_SLEEP = 0x84
@@ -139,7 +142,7 @@ class SX1262:
         # 7. Modulation params: SF, BW, CR
         # SF6 is encoded as 0 in LoRa but 6 in spread - we keep SF >= 7 here
         sf_reg = sf & 0xFF
-        self._set_command(OP_SET_MODULATION_PARAMS, bytes([sf_reg, bw_idx, cr_idx]))
+        self._set_command(OP_SET_MODULATION_PARAMS, bytes([sf_reg, bw_idx, cr_idx, 0x00]))
 
         # 8. Packet params: 16-bit preamble length, header type (0=variable/explicit),
         # payload length (0 = explicit header mode), CRC type (0=off, 1=on),
@@ -188,21 +191,15 @@ class SX1262:
     def retune(self, freq_hz: int, sf: int = DEFAULT_SF, bw_idx: int = DEFAULT_BW_IDX, cr_idx: int = DEFAULT_CR_IDX) -> None:
         """Fast frequency/bandwidth change without the full init() sequence.
 
-        Switching between the uplink channel (903.9 MHz / 125 kHz) and the
-        US915 RX1 downlink channel (923.3 MHz / 500 kHz) needs only these
-        three registers. The full init() also touches PA config, TX params,
-        packet params, sync word, IRQ params and buffer base, none of which
-        change between TX and RX in this application, and each is a
-        separate I2C-bridge round-trip. On a hardware LoRaWAN join, RX1/RX2
-        are narrow, precisely-timed windows (LoRaWAN spec: 1-6s post-TX);
-        11 round-trips of unnecessary setup was eating enough wall-clock
-        time to plausibly miss them. This cuts it to 4.
+        Packet parameters (including IQ polarity) are set separately by
+        transmit()/receive(). Keep frequency changes short enough to arm RX
+        before the scheduled downlink.
         """
         self._set_command(OP_SET_STANDBY, bytes([STDBY_RC]))
         time.sleep(0.001)
         rf_reg = int((freq_hz << 25) / RF_FREQ_XTAL_HZ) & 0xFFFFFFFF
         self._set_command(OP_SET_RF_FREQUENCY, rf_reg.to_bytes(4, "big"))
-        self._set_command(OP_SET_MODULATION_PARAMS, bytes([sf & 0xFF, bw_idx, cr_idx]))
+        self._set_command(OP_SET_MODULATION_PARAMS, bytes([sf & 0xFF, bw_idx, cr_idx, 0x00]))
         self._set_command(OP_CLEAR_IRQ_STATUS, bytes([0xFF, 0xFF]))
         # Small settling delay: the ATtiny84 bridge returns transient garbage
         # on the IRQ register for the first few reads immediately after a
@@ -212,6 +209,18 @@ class SX1262:
         # from its longer command sequence; this lean path needs one added
         # back explicitly.
         time.sleep(0.003)
+
+    def configure_packet(self, payload_len: int, *, downlink: bool = False) -> None:
+        """LoRaWAN downlinks invert IQ and omit the physical payload CRC."""
+        self._set_command(OP_SET_PACKET_PARAMS, bytes([
+            self._preamble_len >> 8, self._preamble_len & 0xFF,
+            self._header_type, payload_len, 0 if downlink else self._crc_on,
+            int(downlink),
+        ]))
+        # Semtech SX126x inverted-IQ erratum: preserve other register bits.
+        r = self._cmd(0x1D, bytes([0x07, 0x36, 0x00, 0x00]))
+        value = r[4] & ~0x04 if downlink else r[4] | 0x04
+        self._set_command(OP_WRITE_REGISTER, bytes([0x07, 0x36, value]))
 
     # ---------- IRQ ----------
 
@@ -233,11 +242,9 @@ class SX1262:
     def transmit(self, payload: bytes) -> None:
         """Send a single LoRa packet at the configured frequency.
 
-        On the PineDio back cover, the SX1262 IRQ register readback returns
-        static garbage (0xa6a6) so IRQ polling for TX_DONE is unreliable.
-        Instead: kick SetTx, sleep a conservative TX duration (SF7/BW125
-        packet of N bytes takes roughly 70ms; 1.8s is a safe margin that
-        also covers the ~1.4s TCXO warm-up delay seen on this chip).
+        Retains the empirically working 1.8s TX wait. Earlier invalid IRQ
+        readbacks were caused by bridge cursor misalignment; replacing this
+        delay with verified TX_DONE polling is separate timing work.
         """
         if len(payload) > 255:
             raise SX1262Error(f"payload too long: {len(payload)}")
@@ -248,21 +255,14 @@ class SX1262:
         # field to decide how many bytes to radiate, even in explicit header
         # mode. init() leaves it at 0, so without this the chip transmits a
         # zero-length payload and the gateway sees nothing decodable.
-        self._set_command(OP_SET_PACKET_PARAMS, bytes([
-            (self._preamble_len >> 8) & 0xFF,
-            self._preamble_len & 0xFF,
-            self._header_type,
-            len(payload) & 0xFF,
-            self._crc_on,
-            0x00,
-        ]))
+        self.configure_packet(len(payload))
         # Point TX at base 0, write the payload, kick TX with finite timeout
         self._set_command(OP_SET_BUFFER_BASE, bytes([0x00, 0x80]))
         self._set_command(OP_WRITE_BUFFER, bytes([0x00]) + payload)
         # SetTx with ~500ms on-chip timeout (0x7D00 = 32000 ticks * 15.625us = 500ms)
         self._set_command(OP_SET_TX, bytes([0x00, 0x7D, 0x00]))
-        # PineDio quirk: SetTx takes ~1.4s to actually transition chip to TX.
-        # Sleep 1.8s (covers TCXO + TX duration at SF7 BW125).
+        # Conservative existing TX wait; sufficient for joins, but too long
+        # for the normal one-second Class A data RX1 window.
         time.sleep(1.8)
         # After TX, return to standby so next SetTx works
         self._set_command(OP_SET_STANDBY, bytes([0x01]))
@@ -274,27 +274,28 @@ class SX1262:
 
     # ---------- RX ----------
 
-    def receive(self, timeout_s: float) -> Optional[bytes]:
+    def receive(self, timeout_s: float, *, downlink: bool = False) -> Optional[bytes]:
         """Put the radio in RX for up to timeout_s. Return payload bytes
         on RX_DONE, or None on TIMEOUT / CRC error."""
-        # Convert seconds to LoRa time steps: 15.625us per tick
-        # 0xFFFFFF = ~15.7s, 0 = single shot, ~anything = timeout
-        ticks = int(timeout_s * 64_000)  # 1 tick = 15.625us = 1/64000 s
-        ticks = min(ticks, 0xFFFFFF)
-        if timeout_s <= 0:
-            param = 0xFFFFFF
-        else:
-            param = ticks & 0xFFFFFF
-        self._set_command(OP_SET_RX, bytes([
-            (param >> 16) & 0xFF,
-            (param >> 8) & 0xFF,
-            param & 0xFF,
-        ]))
+        self._set_command(OP_SET_STANDBY, bytes([STDBY_RC]))
+        self.configure_packet(255, downlink=downlink)
+        self.clear_irq()
+        # Continuous RX; the software deadline bounds this call. Avoid
+        # three-second timeout/re-arm gaps around the five-second join window.
+        self._set_command(OP_SET_RX, bytes([0xFF, 0xFF, 0xFF]))
         deadline = time.monotonic() + timeout_s + 0.1
         while time.monotonic() < deadline:
             irq = self.get_irq()
+            if irq & ~0x03FF:
+                raise SX1262Error(f"invalid IRQ readback: 0x{irq:04x}")
             if irq & (IRQ_RX_DONE | IRQ_TIMEOUT | IRQ_HEADER_ERROR | IRQ_CRC_ERROR):
+                status = self._cmd(OP_GET_PACKET_STATUS, bytes(4))
+                snr = int.from_bytes(status[3:4], "big", signed=True) / 4
+                log.info("RX irq=0x%04x RSSI=%.1f SNR=%.2f", irq, -status[2] / 2, snr)
+                self._set_command(OP_SET_STANDBY, bytes([STDBY_RC]))
                 self.clear_irq()
+                if irq & (IRQ_HEADER_ERROR | IRQ_CRC_ERROR):
+                    return None
                 if irq & IRQ_RX_DONE:
                     # GetRxBufferStatus: MOSI [0x13, NOP, NOP, NOP] (4 bytes)
                     # MISO: [junk, RFU, payload_length, rx_start_offset]
@@ -305,11 +306,12 @@ class SX1262:
                     start = r[3]
                     if plen == 0 or plen > 255:
                         return None
-                    # ReadBuffer: MOSI [0x1E, offset, NOP x plen] (plen+2 bytes total)
-                    # MISO: [junk, RFU, data0, data1, ..., data(plen-1)]
-                    # payload after opcode = [offset] + plen NOPs = plen+1 bytes
-                    buf = self._cmd(OP_READ_BUFFER, bytes([start] + [0x00] * plen))
-                    return bytes(buf[2 : 2 + plen])
+                    # Opcode, offset, dummy, then payload clocks.
+                    buf = self._cmd(OP_READ_BUFFER, bytes([start, 0x00]) + bytes(plen))
+                    packet = bytes(buf[3:3 + plen])
+                    log.info("RX packet len=%d data=%s", plen, packet.hex())
+                    return packet
                 return None
             time.sleep(0.01)
+        self._set_command(OP_SET_STANDBY, bytes([STDBY_RC]))
         return None
