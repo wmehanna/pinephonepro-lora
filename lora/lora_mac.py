@@ -84,7 +84,7 @@ class LoRaWANNode:
         self.radio.init(
             freq_hz=self.freq_hz,
             sf=7,
-            bw_idx=8,        # 125 kHz
+            bw_idx=0x04,     # 125 kHz (SX1262 BW index, datasheet Table 13-47)
             cr_idx=1,        # 4/5
             preamble_len=8,
             sync_word=0x3444,

@@ -27,6 +27,7 @@ OP_SET_TX_PARAMS = 0x8E
 OP_SET_MODULATION_PARAMS = 0x8B
 OP_SET_PACKET_PARAMS = 0x8C
 OP_SET_BUFFER_BASE = 0x8F
+OP_WRITE_REGISTER = 0x0D
 OP_WRITE_BUFFER = 0x0E
 OP_READ_BUFFER = 0x1E
 OP_SET_TX = 0x83
@@ -44,6 +45,10 @@ STDBY_XOSC = 0x01
 
 # Packet type
 PACKET_TYPE_LORA = 0x01
+
+# LoRa sync word registers (SX1262 datasheet 13.4.2)
+REG_LORA_SYNC_WORD_MSB = 0x0740
+REG_LORA_SYNC_WORD_LSB = 0x0741
 
 # IRQ flags
 IRQ_TX_DONE = 0x0001
@@ -69,7 +74,7 @@ RF_FREQ_XTAL_HZ = 32_000_000
 
 # Default LoRa modulation (SF7 BW125 CR4/5 explicit header)
 DEFAULT_SF = 7
-DEFAULT_BW_IDX = 7   # 125 kHz
+DEFAULT_BW_IDX = 0x04   # 125 kHz (SX1262 datasheet Table 13-47; 0x08 is 10.42 kHz)
 DEFAULT_CR_IDX = 1   # 4/5
 
 
@@ -126,7 +131,7 @@ class SX1262:
 
         # 5. PA config: SX1262, +14 dBm, 4 bits duty, 3 bits hp max
         # paDutyCycle = 0x04, hpMax = 0x07, deviceSel = PA_SX1262
-        self._set_command(OP_SET_PA_CONFIG, bytes([0x04, 0x07, PA_SX1262, 0x00]))
+        self._set_command(OP_SET_PA_CONFIG, bytes([0x04, 0x07, PA_SX1262, 0x01]))
 
         # 6. TX params: power in dBm (signed), ramp time
         self._set_command(OP_SET_TX_PARAMS, bytes([tx_power_dbm & 0xFF, RAMP_200U]))
@@ -142,6 +147,11 @@ class SX1262:
         preamble = preamble_len & 0xFFFF
         header_type = 0x00 if payload_len == 0 else 0x01
         crc_on = 0x01
+        # Cached so transmit() can re-issue SetPacketParams with the real
+        # payload length before each TX (required even in explicit header mode).
+        self._preamble_len = preamble
+        self._header_type = header_type
+        self._crc_on = crc_on
         self._set_command(OP_SET_PACKET_PARAMS, bytes([
             preamble.to_bytes(2, "big")[0],
             preamble.to_bytes(2, "big")[1],
@@ -151,13 +161,17 @@ class SX1262:
             0x00,
         ]))
 
-        # 9. Sync word (LoRa). Set as 2 bytes, MSB first (LoRa: 0x74 for private)
-        # For private LoRaWAN we use 0x12
+        # 9. LoRa sync word. MUST go through WriteRegister at 0x0740/0x0741.
+        # Writing it with WriteBuffer only scribbles into the data buffer and
+        # leaves the sync word at the reset default 0x1424 (private network),
+        # which no public LoRaWAN gateway will decode. Public LoRaWAN = 0x3444.
         sw = sync_word & 0xFFFF
-        # WriteBuffer op with offset 0x07 stores the LoRa sync word in the data buffer
-        # Actually SX1262 stores the LoRa sync word via reg addr 0x0740-0x0741,
-        # but the data-sheet procedure uses WriteBuffer with offset=0x07.
-        self._set_command(OP_WRITE_BUFFER, bytes([0x07, (sw >> 8) & 0xFF, sw & 0xFF]))
+        self._set_command(OP_WRITE_REGISTER, bytes([
+            (REG_LORA_SYNC_WORD_MSB >> 8) & 0xFF,
+            REG_LORA_SYNC_WORD_MSB & 0xFF,
+            (sw >> 8) & 0xFF,
+            sw & 0xFF,
+        ]))
 
         # 10. IRQ params: route all useful IRQs to DIO1 (we poll, but configure anyway).
         # 4 masks of 2 bytes each = 8 bytes total
@@ -202,6 +216,18 @@ class SX1262:
         # Standby first - SX1262 must be in standby before SetTx
         self._set_command(OP_SET_STANDBY, bytes([0x01]))  # STDBY_XOSC, keep TCXO warm
         time.sleep(0.01)
+        # SetPacketParams with the ACTUAL payload length. The SX1262 uses this
+        # field to decide how many bytes to radiate, even in explicit header
+        # mode. init() leaves it at 0, so without this the chip transmits a
+        # zero-length payload and the gateway sees nothing decodable.
+        self._set_command(OP_SET_PACKET_PARAMS, bytes([
+            (self._preamble_len >> 8) & 0xFF,
+            self._preamble_len & 0xFF,
+            self._header_type,
+            len(payload) & 0xFF,
+            self._crc_on,
+            0x00,
+        ]))
         # Point TX at base 0, write the payload, kick TX with finite timeout
         self._set_command(OP_SET_BUFFER_BASE, bytes([0x00, 0x80]))
         self._set_command(OP_WRITE_BUFFER, bytes([0x00]) + payload)
